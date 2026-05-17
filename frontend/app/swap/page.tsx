@@ -1,181 +1,293 @@
-"use client";
+'use client';
 
-import { useState } from "react";
-import { useAccount } from "wagmi";
-import Navigation from "../components/Navigation";
-import ClientOnly from "../ClientOnly";
+import { useState } from 'react';
+import { useAccount, useWriteContract, useWaitForTransactionReceipt, useReadContract, usePublicClient, useChainId } from 'wagmi';
+import { parseUnits, formatUnits } from 'viem';
+import ClientOnly from '../components/ClientOnly';
+import { SWAP_ADDRESS, USDC_ADDRESS, EURC_ADDRESS, USDC_DECIMALS, ARCSCAN_TX } from '@/lib/constants';
+import { showToast, updateToast } from '../components/TxToast';
 
-export default function SwapPage() {
-  const { isConnected, address } = useAccount();
-  const [tokenIn, setTokenIn] = useState<"USDC" | "EURC">("USDC");
-  const [amountIn, setAmountIn] = useState("");
-  const [isLoading, setIsLoading] = useState(false);
-  const [result, setResult] = useState<{
-    txHash: string;
-    explorerUrl: string;
-    amountOut: string;
-  } | null>(null);
-  const [error, setError] = useState<string | null>(null);
+const ERC20_ABI = [
+  {
+    name: 'approve', type: 'function', stateMutability: 'nonpayable',
+    inputs: [{ name: 'spender', type: 'address' }, { name: 'amount', type: 'uint256' }],
+    outputs: [{ name: '', type: 'bool' }],
+  },
+  {
+    name: 'balanceOf', type: 'function', stateMutability: 'view',
+    inputs: [{ name: 'account', type: 'address' }],
+    outputs: [{ name: '', type: 'uint256' }],
+  },
+] as const;
+
+const SWAP_ABI = [
+  {
+    name: 'swap', type: 'function', stateMutability: 'nonpayable',
+    inputs: [
+      { name: 'tokenIn', type: 'address' },
+      { name: 'tokenOut', type: 'address' },
+      { name: 'amountIn', type: 'uint256' },
+    ],
+    outputs: [{ name: 'amountOut', type: 'uint256' }],
+  },
+  {
+    name: 'getAmountOut', type: 'function', stateMutability: 'view',
+    inputs: [{ name: 'tokenIn', type: 'address' }, { name: 'amountIn', type: 'uint256' }],
+    outputs: [{ name: 'amountOut', type: 'uint256' }, { name: 'fee', type: 'uint256' }],
+  },
+] as const;
+
+type Step = 'idle' | 'approving' | 'swapping' | 'done' | 'error';
+
+function fmt(val: bigint | undefined) {
+  if (!val) return '0.00';
+  return parseFloat(formatUnits(val, USDC_DECIMALS)).toFixed(2);
+}
+
+function SwapContent() {
+  const { isConnected, address, chainId } = useAccount();
+  const onCorrectChain = chainId === 5042002;
+  const publicClient = usePublicClient();
+  const [tokenIn, setTokenIn] = useState<'USDC' | 'EURC'>('USDC');
+  const [amountIn, setAmountIn] = useState('');
+  const [step, setStep] = useState<Step>('idle');
+  const [txHash, setTxHash] = useState<`0x${string}` | undefined>();
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
+
+  const tokenInAddress  = tokenIn === 'USDC' ? USDC_ADDRESS : EURC_ADDRESS;
+  const tokenOutAddress = tokenIn === 'USDC' ? EURC_ADDRESS : USDC_ADDRESS;
+  const tokenOutSymbol  = tokenIn === 'USDC' ? 'EURC' : 'USDC';
+
+  const parsedAmountIn = amountIn && parseFloat(amountIn) > 0
+    ? parseUnits(amountIn, USDC_DECIMALS)
+    : undefined;
+
+  // ── Balances ──────────────────────────────────────────────────────────────
+  const { data: usdcBal, refetch: refetchUsdc } = useReadContract({
+    address: USDC_ADDRESS, abi: ERC20_ABI, functionName: 'balanceOf',
+    args: address ? [address] : undefined,
+    query: { enabled: !!address && onCorrectChain, refetchInterval: 8000 },
+  });
+  const { data: eurcBal, refetch: refetchEurc } = useReadContract({
+    address: EURC_ADDRESS, abi: ERC20_ABI, functionName: 'balanceOf',
+    args: address ? [address] : undefined,
+    query: { enabled: !!address && onCorrectChain, refetchInterval: 8000 },
+  });
+
+  const tokenInBal  = tokenIn === 'USDC' ? usdcBal as bigint | undefined : eurcBal as bigint | undefined;
+  const tokenOutBal = tokenIn === 'USDC' ? eurcBal as bigint | undefined : usdcBal as bigint | undefined;
+
+  // ── Quote ─────────────────────────────────────────────────────────────────
+  const { data: quoteData } = useReadContract({
+    address: SWAP_ADDRESS as `0x${string}`,
+    abi: SWAP_ABI, functionName: 'getAmountOut',
+    args: parsedAmountIn ? [tokenInAddress as `0x${string}`, parsedAmountIn] : undefined,
+    query: { enabled: !!parsedAmountIn },
+  });
+
+  const quotedOut = quoteData ? parseFloat(formatUnits(quoteData[0], USDC_DECIMALS)).toFixed(6) : null;
+  const quotedFee = quoteData ? parseFloat(formatUnits(quoteData[1], USDC_DECIMALS)).toFixed(6) : null;
+
+  const { writeContractAsync: approveAsync } = useWriteContract();
+  const { writeContractAsync: swapAsync }    = useWriteContract();
+  const { isLoading: isTxPending } = useWaitForTransactionReceipt({ hash: txHash });
 
   const handleSwap = async () => {
-    if (!amountIn || parseFloat(amountIn) <= 0) {
-      setError("Please enter a valid amount");
-      return;
-    }
-
-    setIsLoading(true);
-    setError(null);
-    setResult(null);
-
+    if (!parsedAmountIn || !address || !publicClient) return;
+    setErrorMsg(null);
+    const id = showToast({ type: 'pending', message: `Approving ${tokenIn}…` });
     try {
-      const response = await fetch("/api/swap", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          tokenIn: tokenIn,
-          tokenOut: tokenIn === "USDC" ? "EURC" : "USDC",
-          amountIn: amountIn,
-          walletAddress: address,
-        }),
+      setStep('approving');
+      const approveTx = await approveAsync({
+        address: tokenInAddress as `0x${string}`,
+        abi: ERC20_ABI,
+        functionName: 'approve',
+        args: [SWAP_ADDRESS as `0x${string}`, parsedAmountIn],
+      });
+      await publicClient.waitForTransactionReceipt({ hash: approveTx });
+
+      updateToast(id, { type: 'pending', message: `Swapping ${tokenIn} → ${tokenOutSymbol}…` });
+      setStep('swapping');
+      const hash = await swapAsync({
+        address: SWAP_ADDRESS as `0x${string}`,
+        abi: SWAP_ABI,
+        functionName: 'swap',
+        args: [tokenInAddress as `0x${string}`, tokenOutAddress as `0x${string}`, parsedAmountIn],
       });
 
-      const data = await response.json();
-
-      if (!response.ok) {
-        throw new Error(data.error || "Swap failed");
-      }
-
-      setResult({
-        txHash: data.txHash,
-        explorerUrl: data.explorerUrl,
-        amountOut: data.amountOut,
-      });
-      setAmountIn("");
+      setTxHash(hash);
+      setStep('done');
+      setAmountIn('');
+      refetchUsdc(); refetchEurc();
+      updateToast(id, { type: 'success', message: `Swapped ${amountIn} ${tokenIn} → ~${quotedOut} ${tokenOutSymbol}`, txHash: hash });
     } catch (err: any) {
-      console.error("Swap error:", err);
-      setError(err.message || "An error occurred during swap");
-    } finally {
-      setIsLoading(false);
+      setErrorMsg(err?.shortMessage ?? err?.message ?? 'Swap failed');
+      setStep('error');
+      updateToast(id, { type: 'error', message: err?.shortMessage ?? 'Swap failed' });
     }
   };
 
+  const isLoading = step === 'approving' || step === 'swapping' || isTxPending;
+
+  const insufficientBal = parsedAmountIn && tokenInBal !== undefined && parsedAmountIn > tokenInBal;
+
+  if (!isConnected) {
+    return (
+      <div className="glass-card p-10 text-center animate-fade-in-up" style={{ maxWidth: '480px', margin: '4rem auto' }}>
+        <div style={{ fontSize: '3rem', marginBottom: '1rem' }}>🔄</div>
+        <p style={{ color: 'var(--text-secondary)' }}>Connect your wallet to swap</p>
+      </div>
+    );
+  }
+
+  if (!onCorrectChain) {
+    return (
+      <div className="glass-card p-10 text-center animate-fade-in-up" style={{ maxWidth: '480px', margin: '4rem auto' }}>
+        <div style={{ fontSize: '3rem', marginBottom: '1rem' }}>⚠️</div>
+        <p style={{ color: '#f87171', fontWeight: 600, marginBottom: '0.5rem' }}>Wrong Network</p>
+        <p style={{ color: 'var(--text-secondary)', fontSize: '0.875rem' }}>Switch to <strong>Arc Testnet</strong> (chain ID 5042002) in your wallet to see balances and swap.</p>
+      </div>
+    );
+  }
+
   return (
-    <>
-      <Navigation />
-      <main className="flex min-h-screen flex-col items-center p-6 md:p-24">
-        <div className="max-w-md w-full">
-          <h1 className="text-3xl font-bold mb-2 text-center">Swap</h1>
-          <p className="text-center mb-8 text-gray-600 dark:text-gray-400">
-            Swap between USDC and EURC on Arc Testnet
-          </p>
+    <div style={{ maxWidth: '480px', margin: '0 auto', padding: '2rem 1.5rem' }}>
+      <div className="animate-fade-in-up mb-8">
+        <h1 className="gradient-text" style={{ fontSize: '2rem', fontWeight: 800, letterSpacing: '-0.03em', marginBottom: '0.5rem' }}>
+          Swap
+        </h1>
+        <p style={{ color: 'var(--text-secondary)' }}>Swap between USDC and EURC · 0.3% fee</p>
+      </div>
 
-          <ClientOnly>
-            {!isConnected ? (
-              <div className="text-center p-8 bg-yellow-50 dark:bg-yellow-900/20 rounded-xl">
-                <p className="text-yellow-800 dark:text-yellow-200">
-                  Please connect your wallet to swap
-                </p>
-              </div>
-            ) : (
-              <div className="bg-white dark:bg-gray-800 rounded-xl p-6 shadow-md">
-                {/* Token direction toggle */}
-                <div className="flex gap-2 mb-6">
-                  <button
-                    onClick={() => setTokenIn("USDC")}
-                    className={`flex-1 py-2 rounded font-medium transition-colors ${
-                      tokenIn === "USDC"
-                        ? "bg-blue-600 text-white"
-                        : "bg-gray-200 dark:bg-gray-700 text-gray-700 dark:text-gray-300 hover:bg-gray-300 dark:hover:bg-gray-600"
-                    }`}
-                  >
-                    USDC → EURC
-                  </button>
-                  <button
-                    onClick={() => setTokenIn("EURC")}
-                    className={`flex-1 py-2 rounded font-medium transition-colors ${
-                      tokenIn === "EURC"
-                        ? "bg-blue-600 text-white"
-                        : "bg-gray-200 dark:bg-gray-700 text-gray-700 dark:text-gray-300 hover:bg-gray-300 dark:hover:bg-gray-600"
-                    }`}
-                  >
-                    EURC → USDC
-                  </button>
-                </div>
-
-                {/* Amount input */}
-                <div className="mb-4">
-                  <label className="block text-sm font-medium mb-2 text-gray-700 dark:text-gray-300">
-                    Amount (in {tokenIn})
-                  </label>
-                  <input
-                    type="number"
-                    placeholder={`Enter amount in ${tokenIn}`}
-                    value={amountIn}
-                    onChange={(e) => setAmountIn(e.target.value)}
-                    className="w-full p-3 border rounded-lg dark:bg-gray-700 dark:border-gray-600 focus:outline-none focus:ring-2 focus:ring-blue-500"
-                    disabled={isLoading}
-                    step="0.01"
-                    min="0"
-                  />
-                </div>
-
-                {/* Swap button */}
-                <button
-                  onClick={handleSwap}
-                  disabled={isLoading || !amountIn || parseFloat(amountIn) <= 0}
-                  className="w-full bg-purple-600 text-white py-3 rounded-lg font-semibold hover:bg-purple-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
-                >
-                  {isLoading ? (
-                    <span className="flex items-center justify-center gap-2">
-                      <svg className="animate-spin h-5 w-5 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
-                        <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
-                        <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
-                      </svg>
-                      Swapping...
-                    </span>
-                  ) : (
-                    `Swap ${tokenIn} → ${tokenIn === "USDC" ? "EURC" : "USDC"}`
-                  )}
-                </button>
-
-                {/* Error message */}
-                {error && (
-                  <div className="mt-4 p-3 bg-red-100 dark:bg-red-900/30 border border-red-300 dark:border-red-800 rounded-lg">
-                    <p className="text-red-700 dark:text-red-400 text-sm">{error}</p>
-                  </div>
-                )}
-
-                {/* Success result */}
-                {result && (
-                  <div className="mt-4 p-3 bg-green-100 dark:bg-green-900/30 border border-green-300 dark:border-green-800 rounded-lg">
-                    <p className="text-green-700 dark:text-green-400 font-semibold mb-2">
-                      ✓ Swap successful!
-                    </p>
-                    <p className="text-sm text-green-600 dark:text-green-400 mb-2">
-                      Received: <span className="font-mono">{result.amountOut}</span> {tokenIn === "USDC" ? "EURC" : "USDC"}
-                    </p>
-                    <a
-                      href={result.explorerUrl}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="text-sm text-blue-600 dark:text-blue-400 underline hover:no-underline break-all"
-                    >
-                      View on Arc Scan →
-                    </a>
-                  </div>
-                )}
-
-                {/* Info note */}
-                <div className="mt-4 p-2 text-center text-xs text-gray-500 dark:text-gray-400">
-                  <p>Powered by Circle App Kit • 0.02% provider fee</p>
-                </div>
-              </div>
-            )}
-          </ClientOnly>
+      <div className="glass-card p-6 animate-fade-in-up delay-100">
+        {/* Direction toggle */}
+        <div className="flex mb-6" style={{ background: 'rgba(255,255,255,0.03)', borderRadius: '0.75rem', padding: '0.25rem', border: '1px solid rgba(255,255,255,0.06)' }}>
+          {(['USDC', 'EURC'] as const).map(t => (
+            <button key={t}
+              onClick={() => { setTokenIn(t); setAmountIn(''); setStep('idle'); setErrorMsg(null); }}
+              style={{
+                flex: 1, padding: '0.5rem', borderRadius: '0.625rem', border: 'none',
+                cursor: 'pointer', fontWeight: tokenIn === t ? 600 : 400, fontSize: '0.875rem',
+                color: tokenIn === t ? 'white' : 'var(--text-secondary)',
+                background: tokenIn === t ? 'linear-gradient(135deg, #6366f1, #3b82f6)' : 'transparent',
+                transition: 'all 0.2s',
+              }}
+            >
+              {t} → {t === 'USDC' ? 'EURC' : 'USDC'}
+            </button>
+          ))}
         </div>
-      </main>
-    </>
+
+        {/* From */}
+        <div style={{ marginBottom: '1rem' }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.5rem' }}>
+            <label style={{ fontSize: '0.875rem', color: 'var(--text-secondary)' }}>From ({tokenIn})</label>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+              <span style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>
+                Balance: <span style={{ color: 'var(--text-secondary)', fontWeight: 500 }}>{fmt(tokenInBal)} {tokenIn}</span>
+              </span>
+              {tokenInBal && tokenInBal > 0n && (
+                <button
+                  onClick={() => setAmountIn(formatUnits(tokenInBal!, USDC_DECIMALS))}
+                  style={{
+                    fontSize: '0.7rem', padding: '0.15rem 0.45rem', borderRadius: '0.35rem',
+                    border: '1px solid rgba(99,102,241,0.4)', background: 'rgba(99,102,241,0.1)',
+                    color: 'var(--accent-purple)', cursor: 'pointer', fontWeight: 600,
+                  }}
+                >
+                  MAX
+                </button>
+              )}
+            </div>
+          </div>
+          <input
+            type="number" placeholder="0.00" value={amountIn}
+            onChange={e => { setAmountIn(e.target.value); setStep('idle'); setErrorMsg(null); }}
+            className="glass-input"
+            style={{ padding: '0.875rem 1rem', fontSize: '1.25rem', borderColor: insufficientBal ? 'rgba(239,68,68,0.5)' : undefined }}
+            disabled={isLoading}
+          />
+          {insufficientBal && (
+            <p style={{ fontSize: '0.75rem', color: '#f87171', marginTop: '0.3rem' }}>Insufficient {tokenIn} balance</p>
+          )}
+        </div>
+
+        {/* Arrow */}
+        <div style={{ textAlign: 'center', margin: '0.75rem 0', color: 'var(--text-muted)', fontSize: '1.25rem' }}>↓</div>
+
+        {/* To */}
+        <div style={{ marginBottom: '1.5rem' }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.5rem' }}>
+            <label style={{ fontSize: '0.875rem', color: 'var(--text-secondary)' }}>To ({tokenOutSymbol})</label>
+            <span style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>
+              Balance: <span style={{ color: 'var(--text-secondary)', fontWeight: 500 }}>{fmt(tokenOutBal)} {tokenOutSymbol}</span>
+            </span>
+          </div>
+          <div style={{
+            padding: '0.875rem 1rem',
+            background: 'rgba(255,255,255,0.02)',
+            border: '1px solid rgba(255,255,255,0.06)',
+            borderRadius: '0.75rem',
+            fontSize: '1.25rem',
+            color: quotedOut ? 'var(--text-primary)' : 'var(--text-muted)',
+            fontWeight: quotedOut ? 600 : 400,
+          }}>
+            {quotedOut ?? '—'}
+          </div>
+          {quotedFee && (
+            <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)', marginTop: '0.35rem', textAlign: 'right' }}>
+              Fee: {quotedFee} {tokenIn}
+            </div>
+          )}
+        </div>
+
+        {/* Button */}
+        <button
+          className="btn-gradient"
+          onClick={handleSwap}
+          disabled={isLoading || !parsedAmountIn || !!insufficientBal}
+          style={{ width: '100%', padding: '0.9rem', fontSize: '1rem' }}
+        >
+          {step === 'approving' ? 'Step 1/2 — Approving…'
+            : step === 'swapping' || isTxPending ? 'Step 2/2 — Swapping…'
+            : insufficientBal ? `Insufficient ${tokenIn}`
+            : `Swap ${tokenIn} → ${tokenOutSymbol}`}
+        </button>
+
+        {step === 'approving' && (
+          <p style={{ textAlign: 'center', fontSize: '0.75rem', color: 'var(--text-muted)', marginTop: '0.5rem' }}>
+            Confirm approval in wallet
+          </p>
+        )}
+        {step === 'swapping' && (
+          <p style={{ textAlign: 'center', fontSize: '0.75rem', color: 'var(--text-muted)', marginTop: '0.5rem' }}>
+            Confirm swap in wallet
+          </p>
+        )}
+
+        {step === 'done' && txHash && (
+          <div style={{ marginTop: '1rem', padding: '0.875rem', background: 'rgba(16,185,129,0.1)', border: '1px solid rgba(16,185,129,0.3)', borderRadius: '0.75rem' }}>
+            <p style={{ color: '#10b981', fontWeight: 600, marginBottom: '0.5rem' }}>✓ Swap successful</p>
+            <a href={ARCSCAN_TX(txHash)} target="_blank" rel="noopener noreferrer" style={{ fontSize: '0.8125rem', color: 'var(--accent-purple)', textDecoration: 'none' }}>
+              View on ArcScan →
+            </a>
+          </div>
+        )}
+
+        {step === 'error' && errorMsg && (
+          <div style={{ marginTop: '1rem', padding: '0.875rem', background: 'rgba(239,68,68,0.1)', border: '1px solid rgba(239,68,68,0.3)', borderRadius: '0.75rem' }}>
+            <p style={{ color: '#ef4444', fontSize: '0.875rem' }}>{errorMsg}</p>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+export default function SwapPage() {
+  return (
+    <ClientOnly>
+      <SwapContent />
+    </ClientOnly>
   );
 }

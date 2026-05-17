@@ -1,188 +1,217 @@
-import { useAccount, useReadContract, useWriteContract, useWaitForTransactionReceipt } from 'wagmi';
+import { useAccount, useReadContract, useWriteContract, useWaitForTransactionReceipt, usePublicClient } from 'wagmi';
 import { parseUnits, formatUnits } from 'viem';
 import { VAULT_ADDRESS, USDC_ADDRESS, USDC_DECIMALS, VAULT_DECIMALS } from '@/lib/constants';
 
-// Vault ABI (only the functions we need)
 const VAULT_ABI = [
   {
-    type: 'function',
-    name: 'deposit',
-    inputs: [
-      { name: 'assets', type: 'uint256', internalType: 'uint256' },
-      { name: 'receiver', type: 'address', internalType: 'address' }
-    ],
+    type: 'function', name: 'deposit',
+    inputs: [{ name: 'assets', type: 'uint256' }, { name: 'receiver', type: 'address' }],
     outputs: [{ name: 'shares', type: 'uint256' }],
-    stateMutability: 'nonpayable'
+    stateMutability: 'nonpayable',
   },
   {
-    type: 'function',
-    name: 'withdraw',
-    inputs: [
-      { name: 'assets', type: 'uint256', internalType: 'uint256' },
-      { name: 'receiver', type: 'address', internalType: 'address' },
-      { name: 'owner', type: 'address', internalType: 'address' }
-    ],
+    type: 'function', name: 'withdraw',
+    inputs: [{ name: 'assets', type: 'uint256' }, { name: 'receiver', type: 'address' }, { name: 'owner', type: 'address' }],
     outputs: [{ name: 'shares', type: 'uint256' }],
-    stateMutability: 'nonpayable'
+    stateMutability: 'nonpayable',
   },
   {
-    type: 'function',
-    name: 'totalAssets',
-    inputs: [],
-    outputs: [{ name: '', type: 'uint256' }],
-    stateMutability: 'view'
+    type: 'function', name: 'totalAssets',
+    inputs: [], outputs: [{ name: '', type: 'uint256' }],
+    stateMutability: 'view',
   },
   {
-    type: 'function',
-    name: 'balanceOf',
+    type: 'function', name: 'balanceOf',
     inputs: [{ name: 'account', type: 'address' }],
     outputs: [{ name: '', type: 'uint256' }],
-    stateMutability: 'view'
+    stateMutability: 'view',
   },
   {
-    type: 'function',
-    name: 'convertToShares',
+    type: 'function', name: 'convertToShares',
     inputs: [{ name: 'assets', type: 'uint256' }],
     outputs: [{ name: 'shares', type: 'uint256' }],
-    stateMutability: 'view'
+    stateMutability: 'view',
   },
   {
-    type: 'function',
-    name: 'convertToAssets',
+    type: 'function', name: 'convertToAssets',
     inputs: [{ name: 'shares', type: 'uint256' }],
     outputs: [{ name: 'assets', type: 'uint256' }],
-    stateMutability: 'view'
-  }
-];
+    stateMutability: 'view',
+  },
+] as const;
 
-// USDC approval ABI (ERC20)
 const USDC_ABI = [
   {
-    type: 'function',
-    name: 'approve',
-    inputs: [
-      { name: 'spender', type: 'address' },
-      { name: 'amount', type: 'uint256' }
-    ],
+    type: 'function', name: 'approve',
+    inputs: [{ name: 'spender', type: 'address' }, { name: 'amount', type: 'uint256' }],
     outputs: [{ name: '', type: 'bool' }],
-    stateMutability: 'nonpayable'
+    stateMutability: 'nonpayable',
   },
   {
-    type: 'function',
-    name: 'allowance',
-    inputs: [
-      { name: 'owner', type: 'address' },
-      { name: 'spender', type: 'address' }
-    ],
+    type: 'function', name: 'allowance',
+    inputs: [{ name: 'owner', type: 'address' }, { name: 'spender', type: 'address' }],
     outputs: [{ name: '', type: 'uint256' }],
-    stateMutability: 'view'
-  }
-];
+    stateMutability: 'view',
+  },
+  {
+    type: 'function', name: 'balanceOf',
+    inputs: [{ name: 'account', type: 'address' }],
+    outputs: [{ name: '', type: 'uint256' }],
+    stateMutability: 'view',
+  },
+] as const;
 
 export function useVault() {
-  const { address } = useAccount();
+  const { address, chainId } = useAccount();
+  const publicClient = usePublicClient();
+  const { writeContractAsync } = useWriteContract();
 
-  // Read total assets in vault (in USDC with 6 decimals)
-  const { data: totalAssets } = useReadContract({
+  // Only read when on the correct chain
+  const onCorrectChain = chainId === 5042002;
+
+  const { data: totalAssets, refetch: refetchTotalAssets } = useReadContract({
     address: VAULT_ADDRESS,
     abi: VAULT_ABI,
     functionName: 'totalAssets',
+    query: { enabled: onCorrectChain, refetchInterval: 8000 },
   });
 
-  // Read user's yUSDC balance (shares, 18 decimals)
-  const { data: userShares } = useReadContract({
+  const { data: userShares, refetch: refetchShares } = useReadContract({
     address: VAULT_ADDRESS,
     abi: VAULT_ABI,
     functionName: 'balanceOf',
     args: address ? [address] : undefined,
+    query: { enabled: !!address && onCorrectChain, refetchInterval: 8000 },
   });
 
-  // Convert shares to underlying assets (USDC)
-  const { data: userAssets } = useReadContract({
+  const { data: userAssets, refetch: refetchAssets } = useReadContract({
     address: VAULT_ADDRESS,
     abi: VAULT_ABI,
     functionName: 'convertToAssets',
-    args: userShares ? [userShares] : undefined,
+    args: userShares ? [userShares as bigint] : undefined,
+    query: { enabled: !!userShares && onCorrectChain, refetchInterval: 8000 },
   });
 
-  // USDC allowance for vault
-  const { data: allowance } = useReadContract({
+  const { data: allowance, refetch: refetchAllowance } = useReadContract({
     address: USDC_ADDRESS,
     abi: USDC_ABI,
     functionName: 'allowance',
     args: address ? [address, VAULT_ADDRESS] : undefined,
+    query: { enabled: !!address && onCorrectChain, refetchInterval: 8000 },
   });
 
-  // Write contracts
-  const { writeContract: approve, isPending: isApproving, data: approveHash } = useWriteContract();
-  const { writeContract: deposit, isPending: isDepositing, data: depositHash } = useWriteContract();
-  const { writeContract: withdraw, isPending: isWithdrawing, data: withdrawHash } = useWriteContract();
+  const { data: walletUSDC, refetch: refetchWalletUSDC } = useReadContract({
+    address: USDC_ADDRESS,
+    abi: USDC_ABI,
+    functionName: 'balanceOf',
+    args: address ? [address] : undefined,
+    query: { enabled: !!address && onCorrectChain, refetchInterval: 8000 },
+  });
 
-  // Wait for transactions
-  const { isLoading: isApprovingTx } = useWaitForTransactionReceipt({ hash: approveHash });
-  const { isLoading: isDepositingTx } = useWaitForTransactionReceipt({ hash: depositHash });
-  const { isLoading: isWithdrawingTx } = useWaitForTransactionReceipt({ hash: withdrawHash });
+  const refetchAll = () => {
+    refetchTotalAssets();
+    refetchShares();
+    refetchAssets();
+    refetchAllowance();
+    refetchWalletUSDC();
+  };
 
-  // Helper: approve USDC spend
-  const approveUSDC = (amount: string) => {
+  /**
+   * Approve + Deposit in one call.
+   * - If current allowance is insufficient, fires approve tx and waits for it.
+   * - Then fires deposit tx and waits for it.
+   * - Returns the deposit tx hash.
+   */
+  const approveAndDeposit = async (amount: string, receiver: string): Promise<`0x${string}`> => {
+    if (!address || !publicClient) throw new Error('Wallet not connected');
     const amountRaw = parseUnits(amount, USDC_DECIMALS);
-    approve({
+    const currentAllowance = (allowance as bigint) ?? 0n;
+
+    // Step 1: Approve if needed
+    if (currentAllowance < amountRaw) {
+      const approveTxHash = await writeContractAsync({
+        address: USDC_ADDRESS,
+        abi: USDC_ABI,
+        functionName: 'approve',
+        args: [VAULT_ADDRESS, amountRaw],
+      });
+      // Wait for approval to be mined
+      await publicClient.waitForTransactionReceipt({ hash: approveTxHash });
+    }
+
+    // Step 2: Deposit
+    const depositTxHash = await writeContractAsync({
+      address: VAULT_ADDRESS,
+      abi: VAULT_ABI,
+      functionName: 'deposit',
+      args: [amountRaw, receiver as `0x${string}`],
+    });
+    await publicClient.waitForTransactionReceipt({ hash: depositTxHash });
+    refetchAll();
+    return depositTxHash;
+  };
+
+  /**
+   * Withdraw USDC from vault (assets, not shares).
+   */
+  const withdrawUSDC = async (amount: string, receiver: string, owner: string): Promise<`0x${string}`> => {
+    if (!address || !publicClient) throw new Error('Wallet not connected');
+    const amountRaw = parseUnits(amount, USDC_DECIMALS);
+    const hash = await writeContractAsync({
+      address: VAULT_ADDRESS,
+      abi: VAULT_ABI,
+      functionName: 'withdraw',
+      args: [amountRaw, receiver as `0x${string}`, owner as `0x${string}`],
+    });
+    await publicClient.waitForTransactionReceipt({ hash });
+    refetchAll();
+    return hash;
+  };
+
+  // Legacy helpers kept for compat (agent page uses writeContractAsync directly)
+  const approveUSDC = async (amount: string) => {
+    if (!publicClient) throw new Error('No public client');
+    const amountRaw = parseUnits(amount, USDC_DECIMALS);
+    const hash = await writeContractAsync({
       address: USDC_ADDRESS,
       abi: USDC_ABI,
       functionName: 'approve',
       args: [VAULT_ADDRESS, amountRaw],
     });
+    await publicClient.waitForTransactionReceipt({ hash });
+    refetchAllowance();
+    return hash;
   };
 
-  // Helper: deposit USDC
-  const depositUSDC = (amount: string, receiver: string) => {
-    const amountRaw = parseUnits(amount, USDC_DECIMALS);
-    deposit({
-      address: VAULT_ADDRESS,
-      abi: VAULT_ABI,
-      functionName: 'deposit',
-      args: [amountRaw, receiver],
-    });
+  const depositUSDC = async (amount: string, receiver: string) => {
+    return approveAndDeposit(amount, receiver);
   };
 
-  // Helper: withdraw USDC (amount in USDC, not shares)
-  const withdrawUSDC = (amount: string, receiver: string, owner: string) => {
-    const amountRaw = parseUnits(amount, USDC_DECIMALS);
-    withdraw({
-      address: VAULT_ADDRESS,
-      abi: VAULT_ABI,
-      functionName: 'withdraw',
-      args: [amountRaw, receiver, owner],
-    });
-  };
-
-  // Format helpers
   const formatUSDC = (value: bigint | undefined) => {
-    if (!value) return '0';
-    return formatUnits(value, USDC_DECIMALS);
+    if (!value) return '0.00';
+    return parseFloat(formatUnits(value, USDC_DECIMALS)).toFixed(2);
   };
 
   const formatShares = (value: bigint | undefined) => {
-    if (!value) return '0';
-    return formatUnits(value, VAULT_DECIMALS);
+    if (!value) return '0.00';
+    return parseFloat(formatUnits(value, VAULT_DECIMALS)).toFixed(4);
   };
 
   return {
-    // Data
     totalAssets,
     userShares,
     userAssets,
     allowance,
-    // Actions
+    walletUSDC,
+    approveAndDeposit,
     approveUSDC,
     depositUSDC,
     withdrawUSDC,
-    // Loading states
-    isApproving: isApproving || isApprovingTx,
-    isDepositing: isDepositing || isDepositingTx,
-    isWithdrawing: isWithdrawing || isWithdrawingTx,
-    // Helpers
+    isApproving: false,
+    isDepositing: false,
+    isWithdrawing: false,
     formatUSDC,
     formatShares,
+    refetchAll,
   };
 }

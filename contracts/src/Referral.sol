@@ -16,7 +16,7 @@ contract Referral is Ownable {
     function createReferralCode(string memory code) external {
         require(bytes(code).length > 0, "Code cannot be empty");
         require(codeToReferrer[code] == address(0), "Code already taken");
-        require(referralCodes[msg.sender] == "", "User already has a code");
+        require(bytes(referralCodes[msg.sender]).length == 0, "User already has a code");
 
         referralCodes[msg.sender] = code;
         codeToReferrer[code] = msg.sender;
