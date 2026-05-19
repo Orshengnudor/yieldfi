@@ -10,6 +10,8 @@ const FEATURES = [
   { href: '/send', icon: '📤', label: 'Send', desc: 'Send USDC to any address via Circle AppKit' },
   { href: '/agent', icon: '🤖', label: 'Agent', desc: 'Register your wallet as an ERC-8004 on-chain agent' },
   { href: '/referral', icon: '🎁', label: 'Earn', desc: 'Create a referral code and earn 20% of swap fees' },
+  { href: '/staking', icon: '🔒', label: 'Stake', desc: 'Lock yUSDC for boosted rewards — up to 1.5x multiplier' },
+  { href: '/leaderboard', icon: '🏆', label: 'Leaderboard', desc: 'Top earners ranked by on-chain points activity' },
 ];
 
 export default function HomePage() {

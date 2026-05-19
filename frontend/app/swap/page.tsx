@@ -1,7 +1,7 @@
 'use client';
 
 import { useState } from 'react';
-import { useAccount, useWriteContract, useWaitForTransactionReceipt, useReadContract, usePublicClient, useChainId } from 'wagmi';
+import { useAccount, useWriteContract, useWaitForTransactionReceipt, useReadContract, usePublicClient } from 'wagmi';
 import { parseUnits, formatUnits } from 'viem';
 import ClientOnly from '../components/ClientOnly';
 import { SWAP_ADDRESS, USDC_ADDRESS, EURC_ADDRESS, USDC_DECIMALS, ARCSCAN_TX } from '@/lib/constants';
@@ -27,6 +27,7 @@ const SWAP_ABI = [
       { name: 'tokenIn', type: 'address' },
       { name: 'tokenOut', type: 'address' },
       { name: 'amountIn', type: 'uint256' },
+      { name: 'minAmountOut', type: 'uint256' }, // ← required by contract
     ],
     outputs: [{ name: 'amountOut', type: 'uint256' }],
   },
@@ -88,6 +89,9 @@ function SwapContent() {
   const quotedOut = quoteData ? parseFloat(formatUnits(quoteData[0], USDC_DECIMALS)).toFixed(6) : null;
   const quotedFee = quoteData ? parseFloat(formatUnits(quoteData[1], USDC_DECIMALS)).toFixed(6) : null;
 
+  // minAmountOut = 95% of quoted (5% slippage tolerance)
+  const minAmountOut = quoteData ? (quoteData[0] * 95n) / 100n : 0n;
+
   const { writeContractAsync: approveAsync } = useWriteContract();
   const { writeContractAsync: swapAsync }    = useWriteContract();
   const { isLoading: isTxPending } = useWaitForTransactionReceipt({ hash: txHash });
@@ -104,7 +108,7 @@ function SwapContent() {
         functionName: 'approve',
         args: [SWAP_ADDRESS as `0x${string}`, parsedAmountIn],
       });
-      await publicClient.waitForTransactionReceipt({ hash: approveTx });
+      await publicClient.waitForTransactionReceipt({ hash: approveTx, pollingInterval: 3_000 });
 
       updateToast(id, { type: 'pending', message: `Swapping ${tokenIn} → ${tokenOutSymbol}…` });
       setStep('swapping');
@@ -112,7 +116,12 @@ function SwapContent() {
         address: SWAP_ADDRESS as `0x${string}`,
         abi: SWAP_ABI,
         functionName: 'swap',
-        args: [tokenInAddress as `0x${string}`, tokenOutAddress as `0x${string}`, parsedAmountIn],
+        args: [
+          tokenInAddress as `0x${string}`,
+          tokenOutAddress as `0x${string}`,
+          parsedAmountIn,
+          minAmountOut,
+        ],
       });
 
       setTxHash(hash);
@@ -121,14 +130,14 @@ function SwapContent() {
       refetchUsdc(); refetchEurc();
       updateToast(id, { type: 'success', message: `Swapped ${amountIn} ${tokenIn} → ~${quotedOut} ${tokenOutSymbol}`, txHash: hash });
     } catch (err: any) {
-      setErrorMsg(err?.shortMessage ?? err?.message ?? 'Swap failed');
+      const msg = err?.shortMessage ?? err?.message ?? 'Swap failed';
+      setErrorMsg(msg);
       setStep('error');
-      updateToast(id, { type: 'error', message: err?.shortMessage ?? 'Swap failed' });
+      updateToast(id, { type: 'error', message: msg });
     }
   };
 
   const isLoading = step === 'approving' || step === 'swapping' || isTxPending;
-
   const insufficientBal = parsedAmountIn && tokenInBal !== undefined && parsedAmountIn > tokenInBal;
 
   if (!isConnected) {
@@ -145,7 +154,7 @@ function SwapContent() {
       <div className="glass-card p-10 text-center animate-fade-in-up" style={{ maxWidth: '480px', margin: '4rem auto' }}>
         <div style={{ fontSize: '3rem', marginBottom: '1rem' }}>⚠️</div>
         <p style={{ color: '#f87171', fontWeight: 600, marginBottom: '0.5rem' }}>Wrong Network</p>
-        <p style={{ color: 'var(--text-secondary)', fontSize: '0.875rem' }}>Switch to <strong>Arc Testnet</strong> (chain ID 5042002) in your wallet to see balances and swap.</p>
+        <p style={{ color: 'var(--text-secondary)', fontSize: '0.875rem' }}>Switch to <strong>Arc Testnet</strong> (chain ID 5042002) in your wallet.</p>
       </div>
     );
   }
@@ -236,7 +245,7 @@ function SwapContent() {
           </div>
           {quotedFee && (
             <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)', marginTop: '0.35rem', textAlign: 'right' }}>
-              Fee: {quotedFee} {tokenIn}
+              Fee: {quotedFee} {tokenIn} · Min received: {parseFloat(formatUnits(minAmountOut, USDC_DECIMALS)).toFixed(6)} {tokenOutSymbol}
             </div>
           )}
         </div>

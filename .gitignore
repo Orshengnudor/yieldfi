@@ -11,6 +11,10 @@ contracts/broadcast/
 contracts/out/
 contracts/lib/
 
+# Backend
+backend/node_modules/
+backend/points.db.bin
+
 # Next.js / frontend
 frontend/node_modules/
 frontend/.next/

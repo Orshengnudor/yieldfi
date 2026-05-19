@@ -1,69 +1,87 @@
 'use client';
 
-import { useState, useEffect } from 'react';
-import { useAccount } from 'wagmi';
+import { useState } from 'react';
+import { useAccount, useWriteContract, useReadContract, usePublicClient } from 'wagmi';
+import { parseUnits, formatUnits, isAddress } from 'viem';
 import ClientOnly from '../components/ClientOnly';
-import { ARCSCAN_TX } from '@/lib/constants';
+import { USDC_ADDRESS, USDC_DECIMALS, ARCSCAN_TX } from '@/lib/constants';
 import { showToast, updateToast } from '../components/TxToast';
 
-async function getAdapterAndKit() {
-  const [{ AppKit }, { createViemAdapterFromProvider }] = await Promise.all([
-    import('@circle-fin/app-kit'),
-    import('@circle-fin/adapter-viem-v2'),
-  ]);
-  const raw = (window as any).ethereum;
-  if (!raw) throw new Error('No wallet provider found');
-
-  // Bind methods explicitly — Circle SDK validates provider shape strictly
-  const provider = {
-    request: raw.request.bind(raw),
-    on: raw.on.bind(raw),
-    removeListener: raw.removeListener.bind(raw),
-  };
-
-  const adapter = await createViemAdapterFromProvider(provider as any);
-  const kit = new AppKit();
-  return { kit, adapter };
-}
+const ERC20_ABI = [
+  {
+    name: 'transfer', type: 'function', stateMutability: 'nonpayable',
+    inputs: [{ name: 'to', type: 'address' }, { name: 'amount', type: 'uint256' }],
+    outputs: [{ name: '', type: 'bool' }],
+  },
+  {
+    name: 'balanceOf', type: 'function', stateMutability: 'view',
+    inputs: [{ name: 'account', type: 'address' }],
+    outputs: [{ name: '', type: 'uint256' }],
+  },
+] as const;
 
 function SendContent() {
-  const { isConnected, address } = useAccount();
+  const { isConnected, address, chainId } = useAccount();
+  const publicClient = usePublicClient();
+  const { writeContractAsync } = useWriteContract();
+  const onCorrectChain = chainId === 5042002;
+
   const [recipient, setRecipient] = useState('');
   const [amount, setAmount] = useState('');
   const [txHash, setTxHash] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
 
+  const { data: usdcBalance, refetch: refetchBalance } = useReadContract({
+    address: USDC_ADDRESS,
+    abi: ERC20_ABI,
+    functionName: 'balanceOf',
+    args: address ? [address] : undefined,
+    query: { enabled: !!address && onCorrectChain },
+  });
+
+  const formattedBalance = usdcBalance
+    ? parseFloat(formatUnits(usdcBalance as bigint, USDC_DECIMALS)).toFixed(2)
+    : '0.00';
+
+  const parsedAmount = amount && parseFloat(amount) > 0
+    ? parseUnits(amount, USDC_DECIMALS)
+    : undefined;
+
+  const insufficientBal = parsedAmount && usdcBalance !== undefined
+    && parsedAmount > (usdcBalance as bigint);
+
   const handleSend = async () => {
-    if (!amount || !recipient) return;
-    if (!/^0x[0-9a-fA-F]{40}$/.test(recipient)) {
+    if (!parsedAmount || !recipient || !publicClient) return;
+    if (!isAddress(recipient)) {
       setError('Invalid recipient address');
+      return;
+    }
+    if (insufficientBal) {
+      setError('Insufficient USDC balance');
       return;
     }
 
     setLoading(true);
     setError('');
-    const id = showToast({ type: 'pending', message: 'Initializing AppKit…' });
+    const id = showToast({ type: 'pending', message: `Sending ${amount} USDC…` });
 
     try {
-      const { kit, adapter } = await getAdapterAndKit();
-      updateToast(id, { type: 'pending', message: `Sending ${amount} USDC…` });
+      const hash = await writeContractAsync({
+        address: USDC_ADDRESS,
+        abi: ERC20_ABI,
+        functionName: 'transfer',
+        args: [recipient as `0x${string}`, parsedAmount],
+      });
 
-      const result = await kit.send({
-        // @ts-ignore — adapter used as from context
-        from: adapter,
-        to: recipient,
-        amount,
-        token: 'USDC',
-      } as any);
-
-      const hash = (result as any)?.hash ?? (result as any)?.transactionHash ?? (result as any)?.txHash ?? '';
+      await publicClient.waitForTransactionReceipt({ hash, pollingInterval: 15_000 });
       setTxHash(hash);
-      updateToast(id, { type: 'success', message: `Sent ${amount} USDC`, txHash: hash });
       setAmount('');
       setRecipient('');
+      refetchBalance();
+      updateToast(id, { type: 'success', message: `Sent ${amount} USDC`, txHash: hash });
     } catch (e: any) {
-      const msg = e?.message ?? 'Send failed';
+      const msg = e?.shortMessage ?? e?.message ?? 'Send failed';
       setError(msg);
       updateToast(id, { type: 'error', message: msg });
     } finally {
@@ -80,15 +98,24 @@ function SendContent() {
     );
   }
 
+  if (!onCorrectChain) {
+    return (
+      <div className="glass-card p-10 text-center animate-fade-in-up" style={{ maxWidth: '480px', margin: '4rem auto' }}>
+        <div style={{ fontSize: '3rem', marginBottom: '1rem' }}>⚠️</div>
+        <p style={{ color: '#f87171', fontWeight: 600, marginBottom: '0.5rem' }}>Wrong Network</p>
+        <p style={{ color: 'var(--text-secondary)', fontSize: '0.875rem' }}>Switch to <strong>Arc Testnet</strong> (chain ID 5042002)</p>
+      </div>
+    );
+  }
+
   return (
     <div style={{ maxWidth: '480px', margin: '0 auto', padding: '2rem 1.5rem' }}>
-      {/* Header */}
       <div className="animate-fade-in-up mb-8">
         <h1 className="gradient-text" style={{ fontSize: '2rem', fontWeight: 800, letterSpacing: '-0.03em', marginBottom: '0.5rem' }}>
           Send USDC
         </h1>
         <p style={{ color: 'var(--text-secondary)' }}>
-          Wallet-to-wallet USDC transfer · powered by Circle AppKit
+          Wallet-to-wallet USDC transfer on Arc Testnet
         </p>
       </div>
 
@@ -105,33 +132,56 @@ function SendContent() {
             onChange={e => { setRecipient(e.target.value); setError(''); }}
             className="glass-input"
             style={{ padding: '0.875rem 1rem', fontFamily: 'monospace', fontSize: '0.875rem' }}
+            disabled={loading}
           />
         </div>
 
         {/* Amount */}
         <div style={{ marginBottom: '1.5rem' }}>
-          <label style={{ display: 'block', marginBottom: '0.5rem', fontSize: '0.875rem', color: 'var(--text-secondary)' }}>
-            Amount (USDC)
-          </label>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.5rem' }}>
+            <label style={{ fontSize: '0.875rem', color: 'var(--text-secondary)' }}>Amount (USDC)</label>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+              <span style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>
+                Balance: <span style={{ color: 'var(--text-secondary)', fontWeight: 500 }}>{formattedBalance} USDC</span>
+              </span>
+              {usdcBalance && (usdcBalance as bigint) > 0n && (
+                <button
+                  onClick={() => setAmount(formatUnits(usdcBalance as bigint, USDC_DECIMALS))}
+                  style={{
+                    fontSize: '0.7rem', padding: '0.15rem 0.45rem', borderRadius: '0.35rem',
+                    border: '1px solid rgba(99,102,241,0.4)', background: 'rgba(99,102,241,0.1)',
+                    color: 'var(--accent-purple)', cursor: 'pointer', fontWeight: 600,
+                  }}
+                >
+                  MAX
+                </button>
+              )}
+            </div>
+          </div>
           <input
             type="number"
             placeholder="0.00"
             value={amount}
-            onChange={e => setAmount(e.target.value)}
+            onChange={e => { setAmount(e.target.value); setError(''); }}
             className="glass-input"
-            style={{ padding: '0.875rem 1rem', fontSize: '1.5rem' }}
+            style={{
+              padding: '0.875rem 1rem', fontSize: '1.5rem',
+              borderColor: insufficientBal ? 'rgba(239,68,68,0.5)' : undefined,
+            }}
+            disabled={loading}
           />
+          {insufficientBal && (
+            <p style={{ fontSize: '0.75rem', color: '#f87171', marginTop: '0.3rem' }}>Insufficient balance</p>
+          )}
         </div>
 
         {/* From display */}
-        <div
-          style={{
-            display: 'flex', justifyContent: 'space-between',
-            padding: '0.75rem 1rem', marginBottom: '1.25rem',
-            background: 'rgba(255,255,255,0.03)',
-            borderRadius: '0.75rem', border: '1px solid rgba(255,255,255,0.06)',
-          }}
-        >
+        <div style={{
+          display: 'flex', justifyContent: 'space-between',
+          padding: '0.75rem 1rem', marginBottom: '1.25rem',
+          background: 'rgba(255,255,255,0.03)',
+          borderRadius: '0.75rem', border: '1px solid rgba(255,255,255,0.06)',
+        }}>
           <span style={{ fontSize: '0.8125rem', color: 'var(--text-muted)' }}>From</span>
           <span style={{ fontSize: '0.8125rem', fontFamily: 'monospace', color: 'var(--text-secondary)' }}>
             {address ? `${address.slice(0, 8)}…${address.slice(-6)}` : '—'}
@@ -141,20 +191,18 @@ function SendContent() {
         <button
           className="btn-gradient"
           onClick={handleSend}
-          disabled={loading || !amount || !recipient}
+          disabled={loading || !parsedAmount || !!insufficientBal || !recipient}
           style={{ width: '100%', padding: '0.9rem', fontSize: '1rem' }}
         >
           {loading ? 'Sending…' : 'Send USDC'}
         </button>
 
-        {/* Error */}
         {error && (
           <div style={{ marginTop: '1rem', padding: '0.875rem', background: 'rgba(239,68,68,0.1)', border: '1px solid rgba(239,68,68,0.3)', borderRadius: '0.75rem' }}>
             <p style={{ color: '#ef4444', fontSize: '0.875rem' }}>{error}</p>
           </div>
         )}
 
-        {/* Success */}
         {txHash && !error && (
           <div style={{ marginTop: '1rem', padding: '0.875rem', background: 'rgba(16,185,129,0.1)', border: '1px solid rgba(16,185,129,0.3)', borderRadius: '0.75rem' }}>
             <p style={{ color: '#10b981', fontWeight: 600, marginBottom: '0.5rem' }}>✓ Transfer complete</p>

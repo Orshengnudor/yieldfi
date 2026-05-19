@@ -11,8 +11,10 @@ const NAV_LINKS = [
   { href: '/swap',      label: 'Swap'   },
   { href: '/bridge',    label: 'Bridge' },
   { href: '/send',      label: 'Send'   },
-  { href: '/agent',     label: 'Agent'  },
-  { href: '/referral',  label: 'Earn'   },
+  { href: '/agent',       label: 'Agent'      },
+  { href: '/referral',    label: 'Earn'       },
+  { href: '/staking',     label: 'Stake'      },
+  { href: '/leaderboard', label: 'Leaderboard' },
 ];
 
 export default function Navigation() {

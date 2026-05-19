@@ -136,7 +136,7 @@ export function useVault() {
         args: [VAULT_ADDRESS, amountRaw],
       });
       // Wait for approval to be mined
-      await publicClient.waitForTransactionReceipt({ hash: approveTxHash });
+      await publicClient.waitForTransactionReceipt({ hash: approveTxHash, pollingInterval: 15_000 });
     }
 
     // Step 2: Deposit
@@ -146,7 +146,7 @@ export function useVault() {
       functionName: 'deposit',
       args: [amountRaw, receiver as `0x${string}`],
     });
-    await publicClient.waitForTransactionReceipt({ hash: depositTxHash });
+    await publicClient.waitForTransactionReceipt({ hash: depositTxHash, pollingInterval: 15_000 });
     refetchAll();
     return depositTxHash;
   };
@@ -163,7 +163,7 @@ export function useVault() {
       functionName: 'withdraw',
       args: [amountRaw, receiver as `0x${string}`, owner as `0x${string}`],
     });
-    await publicClient.waitForTransactionReceipt({ hash });
+    await publicClient.waitForTransactionReceipt({ hash, pollingInterval: 15_000 });
     refetchAll();
     return hash;
   };
@@ -178,7 +178,7 @@ export function useVault() {
       functionName: 'approve',
       args: [VAULT_ADDRESS, amountRaw],
     });
-    await publicClient.waitForTransactionReceipt({ hash });
+    await publicClient.waitForTransactionReceipt({ hash, pollingInterval: 15_000 });
     refetchAllowance();
     return hash;
   };

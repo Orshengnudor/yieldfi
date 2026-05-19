@@ -79,6 +79,27 @@ const VAULT_ABI = [
     inputs: [{ name: 'shares', type: 'uint256' }],
     outputs: [{ name: '', type: 'uint256' }],
   },
+  {
+    name: 'deposit',
+    type: 'function',
+    stateMutability: 'nonpayable',
+    inputs: [
+      { name: 'assets', type: 'uint256' },
+      { name: 'receiver', type: 'address' },
+    ],
+    outputs: [{ name: 'shares', type: 'uint256' }],
+  },
+  {
+    name: 'withdraw',
+    type: 'function',
+    stateMutability: 'nonpayable',
+    inputs: [
+      { name: 'assets', type: 'uint256' },
+      { name: 'receiver', type: 'address' },
+      { name: 'owner', type: 'address' },
+    ],
+    outputs: [{ name: 'shares', type: 'uint256' }],
+  },
 ] as const;
 
 const ERC20_ABI = [
@@ -182,15 +203,24 @@ function useAgentRunner(address: `0x${string}` | undefined, config: AgentConfig 
       // If wallet has idle USDC > 1 USDC, re-deposit it
       const minDeposit = parseUnits('1', USDC_DECIMALS);
       if ((walletBal as bigint) > minDeposit) {
-        log('Idle USDC detected — approving vault for auto-deposit…');
+        log(`Idle USDC detected (${formatUnits(walletBal as bigint, USDC_DECIMALS)} USDC) — approving vault…`);
         const approveTx = await writeContractAsync({
           address: USDC_ADDRESS,
           abi: ERC20_ABI,
           functionName: 'approve',
           args: [VAULT_ADDRESS, walletBal as bigint],
         });
-        await publicClient.waitForTransactionReceipt({ hash: approveTx });
-        log(`Auto-compound: deposited ${formatUnits(walletBal as bigint, USDC_DECIMALS)} USDC into vault`, 'success');
+        await publicClient.waitForTransactionReceipt({ hash: approveTx, pollingInterval: 15_000 });
+        log('Approval confirmed — depositing into vault…');
+
+        const depositTx = await writeContractAsync({
+          address: VAULT_ADDRESS,
+          abi: VAULT_ABI,
+          functionName: 'deposit',
+          args: [walletBal as bigint, address],
+        });
+        await publicClient.waitForTransactionReceipt({ hash: depositTx, pollingInterval: 15_000 });
+        log(`Auto-compound: deposited ${formatUnits(walletBal as bigint, USDC_DECIMALS)} USDC into vault ✓`, 'success');
       } else {
         log('No idle USDC to compound. Position is optimal.', 'success');
       }
@@ -231,7 +261,7 @@ function useAgentRunner(address: `0x${string}` | undefined, config: AgentConfig 
           functionName: 'approve',
           args: [SWAP_ADDRESS, swapAmt],
         });
-        await publicClient.waitForTransactionReceipt({ hash: approveTx });
+        await publicClient.waitForTransactionReceipt({ hash: approveTx, pollingInterval: 15_000 });
         log('Rebalance swap approved. Execute swap on the Swap page.', 'success');
       } else {
         log('Portfolio balanced. No action needed.', 'success');
@@ -242,13 +272,20 @@ function useAgentRunner(address: `0x${string}` | undefined, config: AgentConfig 
   }, [address, writeContractAsync, publicClient, log]);
 
   const runYieldOptimizer = useCallback(async () => {
-    if (!address || !publicClient) return;
+    if (!address || !publicClient || !writeContractAsync) return;
     log('Yield optimizer: reading vault APY snapshot…');
     try {
       const totalAssets = await publicClient.readContract({
         address: VAULT_ADDRESS,
         abi: VAULT_ABI,
         functionName: 'totalAssets',
+      }) as bigint;
+
+      const walletBal = await publicClient.readContract({
+        address: USDC_ADDRESS,
+        abi: ERC20_ABI,
+        functionName: 'balanceOf',
+        args: [address],
       }) as bigint;
 
       // Compare to stored snapshot
@@ -263,10 +300,39 @@ function useAgentRunner(address: `0x${string}` | undefined, config: AgentConfig 
           const growth = Number(totalAssets - BigInt(prevAssets)) / Number(BigInt(prevAssets));
           const apy = (growth / hoursDelta) * 8760 * 100;
           log(`Current APY estimate: ${apy.toFixed(2)}%`);
-          if (apy > 5) log('APY > 5% — vault is performing well. Keep position.', 'success');
-          else if (apy < 1) log('APY < 1% — consider withdrawing from vault.', 'info');
-          else log('APY in normal range.', 'success');
+
+          const minDeposit = parseUnits('1', USDC_DECIMALS);
+          if (apy > 5) {
+            log('APY > 5% — depositing idle wallet USDC into vault…');
+            if (walletBal > minDeposit) {
+              const approveTx = await writeContractAsync({
+                address: USDC_ADDRESS,
+                abi: ERC20_ABI,
+                functionName: 'approve',
+                args: [VAULT_ADDRESS, walletBal],
+              });
+              await publicClient.waitForTransactionReceipt({ hash: approveTx, pollingInterval: 15_000 });
+              log('Approval confirmed — depositing…');
+
+              const depositTx = await writeContractAsync({
+                address: VAULT_ADDRESS,
+                abi: VAULT_ABI,
+                functionName: 'deposit',
+                args: [walletBal, address],
+              });
+              await publicClient.waitForTransactionReceipt({ hash: depositTx, pollingInterval: 15_000 });
+              log(`Yield optimizer: deposited ${formatUnits(walletBal, USDC_DECIMALS)} USDC ✓`, 'success');
+            } else {
+              log('APY > 5% but no idle USDC in wallet to deposit.', 'success');
+            }
+          } else if (apy < 1) {
+            log('APY < 1% — consider withdrawing from vault.', 'info');
+          } else {
+            log('APY in normal range.', 'success');
+          }
         }
+      } else {
+        log('No previous snapshot — recording baseline. Run again in an hour for APY estimate.');
       }
 
       localStorage.setItem(snapKey, JSON.stringify({ assets: totalAssets.toString(), ts: now }));
@@ -274,7 +340,7 @@ function useAgentRunner(address: `0x${string}` | undefined, config: AgentConfig 
     } catch (e: any) {
       log(`Yield optimizer error: ${e?.shortMessage ?? e?.message}`, 'error');
     }
-  }, [address, publicClient, log]);
+  }, [address, publicClient, writeContractAsync, log]);
 
   const runAll = useCallback(async () => {
     if (!config || running) return;
@@ -389,7 +455,7 @@ function AgentContent() {
 
       // Wait for receipt then fetch tokenId
       if (publicClient) {
-        await publicClient.waitForTransactionReceipt({ hash });
+        await publicClient.waitForTransactionReceipt({ hash, pollingInterval: 15_000 });
         await refetchBalance();
         const tokenId = await fetchAgentTokenId();
         const cfg: AgentConfig = {

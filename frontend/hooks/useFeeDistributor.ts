@@ -80,7 +80,7 @@ export function useFeeDistributor() {
       functionName: 'claim',
       args: [],
     });
-    await publicClient.waitForTransactionReceipt({ hash });
+    await publicClient.waitForTransactionReceipt({ hash, pollingInterval: 15_000 });
     refetchEarned();
     return hash;
   };
